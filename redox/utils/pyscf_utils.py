@@ -3,18 +3,12 @@ from types import MethodType
 from typing import Dict
 
 import numpy as np
-from pyscf import gto, lib, scf, dft
-
-
-def write_xyz(mol: gto.Mole, filename: str) -> None:
-    elements = mol.elements
-    coords = mol.atom_coords(unit="Angstrom")
-    with open(filename, "w") as f:
-        f.write(f"{len(elements)}\n")
-        # Convert spin (2S) to multiplicity (2S+1) format, as required by quantum chemistry conventions.
-        f.write(f"{mol.charge} {mol.spin + 1}\n")
-        for ele, coord in zip(elements, coords):
-            f.write(f"{ele: <2}    {coord[0]:10.6f}    {coord[1]:10.6f}    {coord[2]:10.6f}\n")
+import ase.io
+from ase.calculators.calculator import Calculator, all_changes
+from pyscf import gto, lib, symm, scf, dft
+from pyscf.hessian import thermo
+from ase import Atoms, units
+from sella import Sella
 
 
 def read_pcm_eps() -> Dict[str, float]:
@@ -160,7 +154,7 @@ def build_method(config: dict):
     disp = config.get("disp", None)
     grids = config.get("grids", {"atom_grid": (99, 590)})
     nlcgrids = config.get("nlcgrids", {"atom_grid": (50, 194)})
-    verbose = config.get("verbose", 4)
+    verbose = config.get("verbose", 2)
     scf_conv_tol = config.get("scf_conv_tol", 1e-8)
     direct_scf_tol = config.get("direct_scf_tol", 1e-8)
     scf_max_cycle = config.get("scf_max_cycle", 50)
@@ -326,3 +320,219 @@ def get_Hessian_method(mf, xc_3c=None):
     h = mf.Hessian()
     h.auxbasis_response = 2
     return h
+
+
+class PySCFCalculator(Calculator):
+    """
+    PySCF calculator for ASE.
+    This calculator uses PySCF to compute the energy and forces of a system.
+    It can be used with various mean field methods provided by PySCF.
+    """
+    implemented_properties = ["energy", "forces"]
+    default_parameters = {}
+    def __init__(self, method, xc_3c=None, **kwargs):
+        self.method = method
+        self.g_scanner: lib.GradScanner = get_gradient_method(self.method, xc_3c).as_scanner()
+        Calculator.__init__(self, **kwargs)
+
+    def set(self, **kwargs):
+        changed_parameters = Calculator.set(self, **kwargs)
+        if changed_parameters:
+            self.reset()
+
+    def calculate(
+        self,
+        atoms: Atoms = None,
+        properties=None, 
+        system_changes=all_changes,
+    ):
+        if properties is None:
+            properties = self.implemented_properties
+        
+        Calculator.calculate(self, atoms, properties, system_changes)
+        
+        mol: gto.Mole = self.method.mol
+        positions = atoms.get_positions()
+        atomic_numbers = atoms.get_atomic_numbers()
+        Z = np.array([gto.charge(x) for x in mol.elements])
+        if all(Z == atomic_numbers):
+            _atoms = positions
+        else:
+            _atoms = list(zip(atomic_numbers, positions))
+        
+        mol.set_geom_(_atoms, unit="Angstrom")
+        
+        energy, gradients = self.g_scanner(mol)
+
+        # store the energy and forces
+        self.results["energy"] = energy * units.Hartree
+        self.results["forces"] = -gradients * (units.Hartree / units.Bohr)
+
+
+def hessian_function(atoms: Atoms, method: scf.hf.SCF, xc_3c=None)-> np.ndarray:
+    """Calculate the Hessian matrix for the given atoms using the provided method."""
+    method.mol.set_geom_(atoms.get_positions(), unit="Angstrom")
+    method.run()
+    hessian = get_Hessian_method(method, xc_3c=xc_3c).kernel()
+    natom = method.mol.natm
+    hessian = hessian.transpose(0, 2, 1, 3).reshape(3 * natom, 3 * natom)
+    hessian *= (units.Hartree / units.Bohr**2)  # Convert from Hartree/Bohr^2
+    return hessian
+
+
+def optimize_geometry(
+    atoms: Atoms,
+    charge: int = 0,
+    spin: int = 0,
+    config: dict = None,
+    outputfile: str = "mol_opt.xyz",
+) -> dict:
+    if config is None:
+        config = {}
+    # set symmetry tolerance (hardcoded in Angstrom)
+    symm_geom_tol = config.get("symm_geom_tol", 0.05)  # Angstrom
+    symm.geom.TOLERANCE = symm_geom_tol / units.Bohr
+
+    # build method
+    config["charge"] = charge
+    config["spin"] = spin
+    input_atoms_list = [(ele, coord) for ele, coord in zip(atoms.get_chemical_symbols(), atoms.get_positions())]
+    config["inputfile"] = input_atoms_list
+    if "xc" in config and config["xc"].endswith("3c"):
+        xc_3c = config["xc"]
+        mf = build_3c_method(config)
+    else:
+        xc_3c = None
+        mf = build_method(config)
+        
+    # set calculator
+    calc = PySCFCalculator(mf, xc_3c=xc_3c)
+    atoms.calc = calc
+
+    # parameters for Sella
+    sella_opt = Sella(
+        atoms=atoms,
+        order=0,
+        internal=config.get("internal", True),
+        delta0=config.get("delta0", None),
+        eta=float(config.get("eta", 1e-4)),
+        gamma=float(config.get("gamma", 0.1)),
+        eig=config.get("calc_hess", False),
+        threepoint=True,
+        diag_every_n=config.get("diag_every_n", None),
+        hessian_function=lambda x: hessian_function(x, mf, xc_3c=xc_3c),
+    )
+    energy_criteria = float(config.get("energy", 1e-6 * units.Hartree))
+    fmax_criteria = float(config.get("fmax", 4.5e-4 * units.Hartree / units.Bohr))
+    frms_criteria = float(config.get("frms", 3.0e-4 * units.Hartree / units.Bohr))
+    dmax_criteria = float(config.get("dmax", 1.8e-3))
+    drms_criteria = float(config.get("drms", 1.2e-3))
+    max_steps: int = config.get("max_steps", 1000)
+    last_pos = atoms.get_positions().copy()
+    last_energy = np.inf
+    for i in sella_opt.irun(fmax=0, steps=max_steps):
+        delta_pos = np.linalg.norm(atoms.get_positions() - last_pos, axis=1)
+        delta_energy = abs(atoms.get_potential_energy() - last_energy)
+        fmax = np.max(np.abs(atoms.get_forces()))
+        frms = np.sqrt(np.mean(atoms.get_forces()**2))
+        dmax = np.max(delta_pos)
+        drms = np.sqrt(np.mean(delta_pos**2))
+        if (delta_energy < energy_criteria and
+            fmax < fmax_criteria and
+            frms < frms_criteria and
+            dmax < dmax_criteria and
+            drms < drms_criteria):
+            print("Optimization converged based on given criteria.")
+            break
+        last_pos = atoms.get_positions().copy()
+        last_energy = atoms.get_potential_energy()
+    else:
+        Warning("Optimization did not converge within the maximum number of steps.")
+        print(f"Final Energy Change   : {delta_energy:.6e} Eh")
+        print(f"Final MAX force       : {fmax * units.Bohr / units.Hartree:.6e} Eh/Bohr")
+        print(f"Final RMS force       : {frms * units.Bohr / units.Hartree:.6e} Eh/Bohr")
+        print(f"Final MAX displacement: {dmax:.6e} Angstrom")
+        print(f"Final RMS displacement: {drms:.6e} Angstrom")
+    # save final structure
+    ase.io.write(outputfile, atoms, format="xyz")
+    print(f"Optimized geometry saved to {outputfile}")
+
+    # single point
+    mf.kernel()
+    if not mf.converged:
+        Warning("SCF calculation did not converge after optimization.")
+
+    # frequency calculation
+    numerical = config.get("numerical", False)
+    if numerical:
+        try:
+            import finite_diff_gpu as finite_diff
+        except ImportError:
+            from pyscf.tools import finite_diff
+        print("Running numerical Hessian calculation...")
+        displacement = float(config.get("displacement", 1e-3))
+        h = finite_diff.Hessian(get_gradient_method(mf, xc_3c=xc_3c))
+        h.displacement = displacement
+        hessian = h.kernel()
+    else:
+        print("Running analytical Hessian calculation...")
+        h = get_Hessian_method(mf, xc_3c=xc_3c)
+        h.auxbasis_response = 2
+        hessian = h.kernel()
+    
+
+    # vibrational analysis
+    freq_info = thermo.harmonic_analysis(mf.mol, hessian, imaginary_freq=False)
+    # imaginary frequencies
+    freq_au = freq_info["freq_au"]
+    num_imag = np.sum(freq_au < 0)
+    if num_imag > 0:
+        print(f"Note: {num_imag} imaginary frequencies detected!")
+    temp = config.get("temp", 298.15)
+    press = config.get("press", 101325)
+    thermo_info = thermo.thermo(mf, freq_au, temp, press)
+    # log thermo info
+    dump_normal_mode(mf.mol, freq_info)
+    thermo.dump_thermo(mf.mol, thermo_info)
+
+    return thermo_info
+
+
+def run_single_point(
+    atoms: Atoms,
+    charge: int = 0,
+    spin: int = 0,
+    config: dict = None,
+) -> float:
+    # build method
+    config["charge"] = charge
+    config["spin"] = spin
+    input_atoms_list = [(ele, coord) for ele, coord in zip(atoms.get_chemical_symbols(), atoms.get_positions())]
+    config["inputfile"] = input_atoms_list
+    if "xc" in config and config["xc"].endswith("3c"):
+        mf = build_3c_method(config)
+    else:
+        mf = build_method(config)
+    
+    mf.mol.set_geom_(atoms.get_positions(), unit="Angstrom")
+
+    e_tot = mf.kernel()
+    if not mf.converged:
+        Warning("SCF calculation did not converge.")
+    e1 = mf.scf_summary.get("e1", 0.0)
+    e_coul = mf.scf_summary.get("coul", 0.0)
+    e_xc = mf.scf_summary.get("exc", 0.0)
+    e_disp = mf.scf_summary.get("dispersion", 0.0)
+    e_solvent = mf.scf_summary.get("e_solvent", 0.0)
+
+    # log results
+    print(f"Total Energy        [Eh]: {e_tot:16.10f}")
+    print(f"One-electron Energy [Eh]: {e1:16.10f}")
+    print(f"Coulomb Energy      [Eh]: {e_coul:16.10f}")
+    print(f"XC Energy           [Eh]: {e_xc:16.10f}")
+    if abs(e_disp) > 1e-10:
+        print(f"Dispersion Energy   [Eh]: {e_disp:16.10f}")
+    if abs(e_solvent) > 1e-10:
+        print(f"Solvent Energy      [Eh]: {e_solvent:16.10f}")
+
+    return e_tot
