@@ -27,6 +27,20 @@ def read_input(input_str: str) -> str:
     print(f"Wrote XYZ file to {xyzfile}")
     return xyzfile
 
+def free_gpu():
+    import cupy as cp
+    import gc
+    import torch
+    """Free all GPU memory from CuPy and remove Python references."""
+    # CuPy memory
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
+    # PyTorch
+    torch.cuda.empty_cache()
+    
+    # Force Python GC (frees JAX buffers)
+    gc.collect()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -91,6 +105,9 @@ def main():
         config=opt_config,
         outputfile=f"{ox_input.split('.')[0]}_opt.xyz",
     )
+    
+    free_gpu()
+    
     red_thermo_info = optimize_geometry(
         red_atoms,
         charge=red_charge,
@@ -98,6 +115,8 @@ def main():
         config=opt_config,
         outputfile=f"{red_input.split('.')[0]}_opt.xyz",
     )
+    
+    free_gpu()
 
     # step4: single point energy calculation
     sp_config = config.get("single_point", None)
@@ -168,8 +187,12 @@ def main():
     red_G_solv = red_smd_energy - red_gas_energy
 
     E_ref = config.get("E_ref", 4.44)  # default to SHE
-    n_electrons = config["n_electrons"]
-    n_protons = config["n_protons"]
+    
+    n_red = len(red_atoms.get_atomic_numbers())
+    n_ox = len(ox_atoms.get_atomic_numbers())
+    
+    n_e = abs(n_red - n_ox)
+    
     ox_delta_G = (ox_thermo_info["G_tot"][0] - ox_thermo_info["E_elec"][0])
     red_delta_G = (red_thermo_info["G_tot"][0] - red_thermo_info["E_elec"][0])
     print("\n=== Final Results ===")
@@ -182,9 +205,10 @@ def main():
     delta_G_redox = (
         (red_sp + red_delta_G + red_G_solv)
         - (ox_sp + ox_delta_G + ox_G_solv)
-    ) * Hartree + n_protons * 11.4473
-    E_redox = -delta_G_redox / n_electrons - E_ref
+    ) * Hartree + n_e * 11.4473
+    E_redox = -delta_G_redox / n_e - E_ref
     print(f"Calculated Free Energy Change      [eV]: {delta_G_redox:.6f}")
+    print(f"Number of electrons transferred     : {n_e}")
     print(f"Calculated Redox Potential         [V]: {E_redox:.6f}")
 
 
