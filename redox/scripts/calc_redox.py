@@ -191,7 +191,7 @@ def main():
     n_red = len(red_atoms.get_atomic_numbers())
     n_ox = len(ox_atoms.get_atomic_numbers())
     
-    n_e = n_e = abs(n_red - n_ox)
+    n_e = abs(n_red - n_ox)
     
     ox_delta_G = (ox_thermo_info["G_tot"][0] - ox_thermo_info["E_elec"][0])
     red_delta_G = (red_thermo_info["G_tot"][0] - red_thermo_info["E_elec"][0])
